@@ -18,6 +18,7 @@
 
 | 文档 | 标题 | 说明 |
 |------|------|------|
+| [api-communication.mdx](conversation/api-communication.mdx) | API 通信协议 | AI 如何与后端模型沟通：HTTP+JSON 协议、tool_use/tool_result 机制、流式 SSE |
 | [the-loop.mdx](conversation/the-loop.mdx) | Agentic Loop | AI 自主循环的核心机制（query.ts 状态机） |
 | [streaming.mdx](conversation/streaming.mdx) | 流式响应机制 | 打字机效果原理、流式工具执行 |
 | [multi-turn.mdx](conversation/multi-turn.mdx) | 多轮对话管理 | QueryEngine 会话编排与持久化 |
