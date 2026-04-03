@@ -157,6 +157,205 @@ HTTP 传输的 MCP session 可能过期。检测到 `McpSessionExpiredError` 后
 
 大型 MCP 工具输出通过 `truncateMcpContentIfNeeded` 截断，二进制内容（图片）通过 `persistBinaryContent` 写入文件并返回文件路径。图片自动 resize（`maybeResizeAndDownsampleImageBuffer`）。
 
+## MCP 图片传输机制
+
+MCP 工具返回的图片内容需要经过一系列处理才能安全传递给 Claude API。整个流程涉及格式识别、尺寸调整、压缩、验证等多个环节。
+
+### 支持的图片格式
+
+MCP 客户端识别以下 MIME 类型为图片内容（`client.ts:450-455`）：
+
+| MIME 类型 | 格式 |
+|-----------|------|
+| `image/jpeg` | JPEG |
+| `image/png` | PNG |
+| `image/gif` | GIF |
+| `image/webp` | WebP |
+
+格式检测采用**魔数字节**（magic bytes）识别，而非信任文件扩展名或 MIME 声明，确保格式判断的准确性。
+
+### 图片数据流：从 MCP 到 API
+
+```
+MCP 工具返回结果
+  ↓
+processToolResult()                     ← client.ts 中逐项处理
+  ├── type: 'image'                     ← 直接图片内容
+  │   ├── Buffer.from(data, 'base64')   ← 解码 base64
+  │   ├── maybeResizeAndDownsampleImageBuffer()  ← 调整尺寸和压缩
+  │   └── 返回 ImageBlockParam { type: 'image', source: { type: 'base64', data, media_type } }
+  │
+  ├── type: 'resource' + blob           ← 资源类型（带 blob 数据）
+  │   ├── 检测 mimeType 是否为图片
+  │   ├── 图片路径: 同上处理
+  │   └── 非图片路径: persistBlobToTextBlock() 写入磁盘返回文件路径
+  │
+  └── type: 'text' / 'audio'           ← 其他类型，不走图片流程
+```
+
+### API 限制与约束
+
+Claude API 对图片有严格的尺寸限制（定义在 `src/constants/apiLimits.ts`）：
+
+| 限制项 | 值 | 说明 |
+|--------|-----|------|
+| 最大 base64 大小 | 5 MB | `API_IMAGE_MAX_BASE64_SIZE`，base64 编码后的字符串长度上限 |
+| 目标原始大小 | 3.75 MB | `IMAGE_TARGET_RAW_SIZE`，base64 编码前的原始字节数上限（5MB * 3/4） |
+| 最大宽度 | 2000 px | `IMAGE_MAX_WIDTH`，客户端侧缩放上限 |
+| 最大高度 | 2000 px | `IMAGE_MAX_HEIGHT`，客户端侧缩放上限 |
+| 每次请求最大媒体数 | 100 | `API_MAX_MEDIA_PER_REQUEST`，包括图片和 PDF |
+
+### 图片压缩策略（分级降级）
+
+当图片超出尺寸或大小限制时，`maybeResizeAndDownsampleImageBuffer()`（`src/utils/imageResizer.ts`）按以下策略**逐级降级**：
+
+```
+原图 → 检查尺寸和大小
+  │
+  ├── ✅ 尺寸 ≤ 2000x2000 且大小 ≤ 3.75MB → 原样返回
+  │
+  ├── 大小超标但尺寸未超 →
+  │   ├── PNG? → 尝试 PNG 压缩（compressionLevel: 9 + palette）
+  │   ├── JPEG 80 → JPEG 60 → JPEG 40 → JPEG 20（递降质量）
+  │   └── 仍超标 → 进入尺寸缩放流程
+  │
+  ├── 尺寸超标 →
+  │   ├── 等比缩放到 2000x2000 以内
+  │   ├── 缩放后仍超大小 → PNG 压缩 → JPEG 递降质量
+  │   └── 极端情况 → 缩放到 1000px 宽 + JPEG quality: 20
+  │
+  └── sharp 模块不可用 →
+      ├── base64 ≤ 5MB → 原样返回（跳过压缩）
+      └── base64 > 5MB → 抛出 ImageResizeError
+```
+
+### MCP 大输出中的图片处理
+
+MCP 工具输出有 token 上限（默认 25000 tokens，可通过 `MAX_MCP_OUTPUT_TOKENS` 环境变量调整）。当输出包含图片时，处理逻辑有特殊分支（`src/utils/mcpValidation.ts`）：
+
+- 每张图片估算为 **1600 tokens**
+- 如果内容包含图片且超出 token 预算，使用**截断**而非文件持久化（持久化会破坏图片的压缩格式，使图片变成不可查看的 JSON 文本）
+- 截断时，图片会尝试**压缩到剩余空间**内：
+  - 剩余字符数转换为剩余字节数（`remainingChars * 0.75`，因为 base64 编码比率）
+  - 调用 `compressImageBlock()` 压缩图片到目标大小
+
+### API 边界的最终验证
+
+在消息发送到 API 前，`validateImagesForAPI()`（`src/utils/imageValidation.ts`）作为最后一道防线：
+
+- 遍历所有用户消息中的 base64 图片块
+- 检查 base64 字符串长度是否超过 5MB 上限
+- 超标时抛出 `ImageSizeError`，给出明确的错误提示
+
+这是一个**纵深防御**设计：即使上游处理遗漏了某张超大图片，API 边界的验证也会捕获它，防止发出会被 API 拒绝的请求。
+
+### AI 如何理解图片：从 base64 到视觉语义
+
+base64 只是图片的**传输编码格式**，AI 不是通过"阅读"base64 文本来理解图片的。整个处理链路全部在 **Anthropic 服务器端**完成：
+
+```
+客户端（CCB）                              服务器端（Anthropic API）
+─────────────                              ─────────────────────────
+图片文件                                    
+  ↓ base64 编码                            
+base64 字符串                              
+  ↓ 打包 JSON                             
+HTTP POST 请求  ──── 网络传输 ────→  收到 JSON 请求
+                                           ↓ base64 解码
+                                    原始像素数据（JPEG/PNG）
+                                           ↓ Vision Encoder (类 ViT 架构)
+                                    视觉 tokens（特征向量）
+                                           ↓ 与文本 tokens 混合
+                                    Transformer 模型推理
+                                           ↓
+                                    Claude 生成回复
+```
+
+**客户端唯一的职责**是确保图片在 API 限制内（≤5MB base64、≤2000x2000 像素），然后发送。所有的解码、视觉理解、推理都在服务器端完成。
+
+每张图片会被视觉编码器转换为约 **1600 个视觉 tokens**，这些 tokens 占用对话的上下文窗口，与文本 tokens 使用相同的预算。
+
+### Claude API 图片请求示例
+
+以下示例展示了最终发送到 Claude API 的请求格式。MCP 工具返回的图片在经过上述处理后，最终也是以这种格式发送的。
+
+**TypeScript 示例（使用 Anthropic SDK）：**
+
+```typescript
+import Anthropic from '@anthropic-ai/sdk'
+import fs from 'fs'
+
+const client = new Anthropic({ apiKey: 'YOUR_API_KEY' })
+
+const imageBuffer = fs.readFileSync('screenshot.png')
+const base64Data = imageBuffer.toString('base64')
+
+const response = await client.messages.create({
+  model: 'claude-sonnet-4-20250514',
+  max_tokens: 1024,
+  messages: [
+    {
+      role: 'user',
+      content: [
+        {
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: 'image/png',
+            data: base64Data,
+          },
+        },
+        {
+          type: 'text',
+          text: '描述一下这张图片的内容',
+        },
+      ],
+    },
+  ],
+})
+```
+
+**Python 示例：**
+
+```python
+import anthropic, base64
+
+client = anthropic.Anthropic(api_key="YOUR_API_KEY")
+
+with open("screenshot.png", "rb") as f:
+    image_data = base64.standard_b64encode(f.read()).decode("utf-8")
+
+message = client.messages.create(
+    model="claude-sonnet-4-20250514",
+    max_tokens=1024,
+    messages=[{
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": image_data,
+                },
+            },
+            {"type": "text", "text": "这张图片里有什么？"},
+        ],
+    }],
+)
+```
+
+请求体中的关键字段：
+
+| 字段 | 说明 |
+|------|------|
+| `type: "image"` | 声明这是一个图片内容块 |
+| `source.type: "base64"` | 传输方式为 base64 编码（也支持 URL 方式） |
+| `source.media_type` | 图片的 MIME 类型（`image/jpeg`、`image/png`、`image/gif`、`image/webp`） |
+| `source.data` | base64 编码后的图片字符串 |
+
+`content` 字段是一个数组，支持在同一条消息中混合多个图片和文本块，Claude 会综合理解所有内容。
+
 ## MCP 连接的并发控制
 
 ```typescript
